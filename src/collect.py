@@ -737,6 +737,52 @@ def collect_spotify_releases(conn, today: date) -> None:
                 logger.save_raw("track", track_id, status, tr_data)
                 done_tracks.add(track_id)
 
+        # 3. Добор: у треков за сегодня могут быть артисты (гости) и альбомы без снимка.
+        #    Берём недостающие из Bronze, поэтому добор работает и после сбоя с повторным запуском.
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT b.payload->'artists'->0->>'id'
+                FROM bronze.raw_response b
+                WHERE b.source = 'spotify' AND b.entity_type = 'track'
+                  AND b.snapshot_date = %s AND b.http_status = 200
+                  AND b.payload->'artists'->0->>'id' IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM bronze.raw_response a
+                    WHERE a.source = 'spotify' AND a.entity_type = 'artist'
+                      AND a.snapshot_date = b.snapshot_date
+                      AND a.entity_id = b.payload->'artists'->0->>'id');
+                """,
+                (today,),
+            )
+            missing_artists = [r[0] for r in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT DISTINCT b.payload->'album'->>'id'
+                FROM bronze.raw_response b
+                WHERE b.source = 'spotify' AND b.entity_type = 'track'
+                  AND b.snapshot_date = %s AND b.http_status = 200
+                  AND b.payload->'album'->>'id' IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM bronze.raw_response a
+                    WHERE a.source = 'spotify' AND a.entity_type = 'album'
+                      AND a.snapshot_date = b.snapshot_date
+                      AND a.entity_id = b.payload->'album'->>'id');
+                """,
+                (today,),
+            )
+            missing_albums = [r[0] for r in cur.fetchall()]
+
+        for artist_id in missing_artists:
+            status, art_data = client.get(f"/artists/{artist_id}")
+            time.sleep(REQUEST_DELAY_SEC)
+            logger.save_raw("artist", artist_id, status, art_data)
+
+        for album_id in missing_albums:
+            status, alb_data = client.get(f"/albums/{album_id}")
+            time.sleep(REQUEST_DELAY_SEC)
+            logger.save_raw("album", album_id, status, alb_data)
+
         logger.finish()
     except Exception as e:
         conn.rollback()
