@@ -41,6 +41,22 @@ CORAL = "#fb7185"
 BLUE = "#78a7ff"
 GREEN = "#9bdd88"
 
+# Названия жанров Deezer для ID, которые используются в DEEZER_GENRE_IDS.
+# ID 0 — общий чарт, а не отдельный музыкальный жанр.
+DEEZER_GENRE_NAMES = {
+    0: "Общий чарт",
+    106: "Электро",
+    116: "Рэп / хип-хоп",
+    132: "Поп",
+    152: "Хаус",
+    165: "Альтернатива",
+}
+
+
+def genre_label(genre_id: int) -> str:
+    return DEEZER_GENRE_NAMES.get(genre_id, f"Жанр Deezer №{genre_id}")
+
+
 PLOTLY_TEMPLATE = go.layout.Template(
     layout=go.Layout(
         paper_bgcolor=PANEL,
@@ -203,8 +219,8 @@ def render_sidebar(dates: list[date]) -> tuple[date | None, date | None, int | N
         from_date = to_date = selected_range
 
     if st.sidebar.button("Обновить данные", use_container_width=True):
+        # fetch_music_dates не кэшируется, поэтому очищать нужно только query.
         query.clear()
-        fetch_music_dates.clear()
         st.rerun()
 
     genre_frame = safe_query(
@@ -217,11 +233,11 @@ def render_sidebar(dates: list[date]) -> tuple[date | None, date | None, int | N
         (from_date, to_date),
     )
     genre_options = [int(v) for v in genre_frame["genre_id"].dropna()] if not genre_frame.empty else []
-    genre = st.sidebar.selectbox("Жанр чарта", ["Все жанры"] + genre_options)
-    genre_id = None if genre == "Все жанры" else int(genre)
+    genre_labels = {genre_label(value): value for value in genre_options}
+    genre = st.sidebar.selectbox("Жанр чарта", ["Все жанры"] + list(genre_labels))
+    genre_id = None if genre == "Все жанры" else genre_labels[genre]
 
     st.sidebar.markdown("---")
-    st.sidebar.caption("Пропуск 22 октября сохранён как пропуск наблюдения и не заполняется искусственными значениями.")
     st.sidebar.caption("Gold обновляется после `collect.py` → `run_silver.py` → `run_gold.py`.")
     return from_date, to_date, genre_id
 
@@ -250,14 +266,6 @@ def render_music_dashboard(from_date: date, to_date: date, genre_id: int | None)
         WHERE snapshot_date BETWEEN %s AND %s
         """ + (" AND genre_id = %s" if genre_id is not None else ""),
         params + ((genre_id,) if genre_id is not None else ()),
-    )
-    releases = safe_query(
-        """
-        SELECT * FROM gold.fact_release_track_daily
-        WHERE snapshot_date BETWEEN %s AND %s
-        ORDER BY snapshot_date, track_popularity DESC NULLS LAST
-        """,
-        params,
     )
     if kpi.empty or tracks.empty:
         empty_state("За выбранный период нет Gold-данных. Сначала выполните `python src/run_gold.py`.")
@@ -316,35 +324,36 @@ def render_music_dashboard(from_date: date, to_date: date, genre_id: int | None)
         st.markdown(f"Срез: **{pd.Timestamp(latest['snapshot_date']).strftime('%d.%m.%Y')}**")
         st.markdown("---")
         st.markdown("### Чартовый сигнал")
+        st.markdown(
+            '<p class="section-note">12 лучших позиций Deezer-чарта на последнюю дату. '
+            '№1 — первое место; цвет показывает, удалось ли сопоставить трек со Spotify.</p>',
+            unsafe_allow_html=True,
+        )
         chart_latest = charts[pd.to_datetime(charts["snapshot_date"]) == latest_date] if not charts.empty else charts
         if chart_latest.empty:
             empty_state("Для выбранного жанра нет чартовых наблюдений.")
         else:
             chart_latest = chart_latest.nsmallest(12, "chart_position").copy()
             chart_latest["label"] = chart_latest["track_name"].fillna(chart_latest["deezer_track_id"]).str.slice(0, 34)
-            fig = px.bar(chart_latest.sort_values("chart_position", ascending=True), x="chart_position", y="label",
-                         orientation="h", color="is_spotify_matched", color_discrete_map={True: CYAN, False: AMBER},
-                         labels={"chart_position": "позиция (меньше — лучше)", "label": "", "is_spotify_matched": "Есть Spotify"})
+            chart_latest["spotify_match"] = chart_latest["is_spotify_matched"].map(
+                {True: "Сопоставлен", False: "Не сопоставлен"}
+            ).fillna("Не сопоставлен")
+            fig = px.bar(
+                chart_latest.sort_values("chart_position", ascending=True),
+                x="chart_position",
+                y="label",
+                orientation="h",
+                color="spotify_match",
+                color_discrete_map={"Сопоставлен": CYAN, "Не сопоставлен": AMBER},
+                labels={
+                    "chart_position": "позиция в чарте (1 — первое место)",
+                    "label": "",
+                    "spotify_match": "Spotify",
+                },
+            )
             fig.update_xaxes(autorange="reversed", title=None)
             fig.update_yaxes(title=None)
             chart(fig, 400)
-
-    st.markdown("## Новые релизы: первые дни")
-    st.markdown('<p class="section-note">Контрольная группа не ограничена попаданием в Deezer-чарт.</p>', unsafe_allow_html=True)
-    if releases.empty:
-        empty_state("Новых релизов за выбранный период нет.")
-    else:
-        rel = releases.copy()
-        rel["release_age_days"] = pd.to_numeric(rel["release_age_days"], errors="coerce")
-        rel["track_popularity"] = pd.to_numeric(rel["track_popularity"], errors="coerce")
-        rel = rel.dropna(subset=["release_age_days", "track_popularity"])
-        fig = px.scatter(rel, x="release_age_days", y="track_popularity", color="album_group",
-                         hover_name="track_name", hover_data=["album_name", "spotify_album_id"],
-                         color_discrete_map={"album": AMBER, "single": CORAL},
-                         labels={"release_age_days": "дней с релиза", "track_popularity": "popularity", "album_group": "тип"})
-        fig.update_yaxes(range=[0, 100], title=None)
-        fig.update_xaxes(title=None)
-        chart(fig, 370)
 
     with st.expander("Детальная таблица треков"):
         visible = tracks[["snapshot_date", "track_name", "artist_name", "spotify_popularity", "popularity_delta_1d", "is_new_release_track", "deezer_rank_max"]].copy()
